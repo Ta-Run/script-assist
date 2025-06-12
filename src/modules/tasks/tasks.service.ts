@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, NotFoundException, HttpException, HttpStatus } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Task } from './entities/task.entity';
@@ -7,24 +7,23 @@ import { UpdateTaskDto } from './dto/update-task.dto';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { TaskStatus } from './enums/task-status.enum';
+import { TaskPriority } from './enums/task-priority.enum';
 
 @Injectable()
 export class TasksService {
   constructor(
     @InjectRepository(Task)
     private tasksRepository: Repository<Task>,
+
     @InjectQueue('task-processing')
     private taskQueue: Queue,
   ) { }
 
-  async create(createTaskDto: CreateTaskDto): Promise<Task> {
-    // Inefficient implementation: creates the task but doesn't use a single transaction
-    // for creating and adding to queue, potential for inconsistent state
-    const task = this.tasksRepository.create(createTaskDto);
+  async create(dto: CreateTaskDto): Promise<Task> {
+    const task = this.tasksRepository.create(dto);
     const savedTask = await this.tasksRepository.save(task);
 
-    // Add to queue without waiting for confirmation or handling errors
-    this.taskQueue.add('task-status-update', {
+    await this.taskQueue.add('task-status-update', {
       taskId: savedTask.id,
       status: savedTask.status,
     });
@@ -34,62 +33,45 @@ export class TasksService {
 
   async findAll(
     limit: number,
-    offset: number = 0,
+    offset: number,
     status?: string,
     priority?: string,
   ): Promise<{ data: Task[]; count: number }> {
-    const queryBuilder = this.tasksRepository
-      .createQueryBuilder('task')
+    const qb = this.tasksRepository.createQueryBuilder('task')
       .leftJoinAndSelect('task.user', 'user')
-      .orderBy('task.createdAt', 'DESC');
+      .orderBy('task.createdAt', 'DESC')
+      .skip(offset)
+      .take(limit);
 
-    if (status) {
-      queryBuilder.andWhere('task.status = :status', { status });
-    }
+    if (status) qb.andWhere('task.status = :status', { status });
+    if (priority) qb.andWhere('task.priority = :priority', { priority });
 
-    if (priority) {
-      queryBuilder.andWhere('task.priority = :priority', { priority });
-    }
-
-    const [data, count] = await queryBuilder.skip(offset).take(limit).getManyAndCount();
-
+    const [data, count] = await qb.getManyAndCount();
     return { data, count };
   }
 
-
   async findOne(id: string): Promise<Task> {
-    // Inefficient implementation: two separate database calls
-    const count = await this.tasksRepository.count({ where: { id } });
+    const task = await this.tasksRepository.findOne({
+      where: { id },
+      relations: ['user'],
+    });
 
-    if (count === 0) {
+    if (!task) {
       throw new NotFoundException(`Task with ID ${id} not found`);
     }
 
-    return (await this.tasksRepository.findOne({
-      where: { id },
-      relations: ['user'],
-    })) as Task;
+    return task;
   }
 
-  async update(id: string, updateTaskDto: UpdateTaskDto): Promise<Task> {
-    // Inefficient implementation: multiple database calls
-    // and no transaction handling
+  async update(id: string, dto: UpdateTaskDto): Promise<Task> {
     const task = await this.findOne(id);
-
     const originalStatus = task.status;
 
-    // Directly update each field individually
-    if (updateTaskDto.title) task.title = updateTaskDto.title;
-    if (updateTaskDto.description) task.description = updateTaskDto.description;
-    if (updateTaskDto.status) task.status = updateTaskDto.status;
-    if (updateTaskDto.priority) task.priority = updateTaskDto.priority;
-    if (updateTaskDto.dueDate) task.dueDate = updateTaskDto.dueDate;
-
+    Object.assign(task, dto);
     const updatedTask = await this.tasksRepository.save(task);
 
-    // Add to queue if status changed, but without proper error handling
     if (originalStatus !== updatedTask.status) {
-      this.taskQueue.add('task-status-update', {
+      await this.taskQueue.add('task-status-update', {
         taskId: updatedTask.id,
         status: updatedTask.status,
       });
@@ -99,21 +81,53 @@ export class TasksService {
   }
 
   async remove(id: string): Promise<void> {
-    // Inefficient implementation: two separate database calls
     const task = await this.findOne(id);
     await this.tasksRepository.remove(task);
   }
 
-  async findByStatus(status: TaskStatus): Promise<Task[]> {
-    // Inefficient implementation: doesn't use proper repository patterns
-    const query = 'SELECT * FROM tasks WHERE status = $1';
-    return this.tasksRepository.query(query, [status]);
+  async getStatistics() {
+    const tasks = await this.tasksRepository.find();
+    return {
+      total: tasks.length,
+      completed: tasks.filter(t => t.status === TaskStatus.COMPLETED).length,
+      inProgress: tasks.filter(t => t.status === TaskStatus.IN_PROGRESS).length,
+      pending: tasks.filter(t => t.status === TaskStatus.PENDING).length,
+      highPriority: tasks.filter(t => t.priority === TaskPriority.HIGH).length,
+    };
   }
 
-  async updateStatus(id: string, status: string): Promise<Task> {
-    // This method will be called by the task processor
+  async batchProcessTasks(taskIds: string[], action: 'complete' | 'delete') {
+    const results = [];
+
+    for (const taskId of taskIds) {
+      try {
+        let result;
+
+        if (action === 'complete') {
+          result = await this.update(taskId, { status: TaskStatus.COMPLETED });
+        } else if (action === 'delete') {
+          await this.remove(taskId);
+          result = { deleted: true };
+        } else {
+          throw new HttpException(`Unknown action: ${action}`, HttpStatus.BAD_REQUEST);
+        }
+
+        results.push({ taskId, success: true, result });
+      } catch (error) {
+        results.push({
+          taskId,
+          success: false,
+          error: error instanceof Error ? error.message : 'Unknown error',
+        });
+      }
+    }
+
+    return results;
+  }
+
+  async updateStatus(id: string, status: TaskStatus): Promise<Task> {
     const task = await this.findOne(id);
-    task.status = status as any;
+    task.status = status;
     return this.tasksRepository.save(task);
   }
 }
