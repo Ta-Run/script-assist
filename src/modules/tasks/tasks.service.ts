@@ -15,7 +15,7 @@ export class TasksService {
     private tasksRepository: Repository<Task>,
     @InjectQueue('task-processing')
     private taskQueue: Queue,
-  ) {}
+  ) { }
 
   async create(createTaskDto: CreateTaskDto): Promise<Task> {
     // Inefficient implementation: creates the task but doesn't use a single transaction
@@ -32,13 +32,30 @@ export class TasksService {
     return savedTask;
   }
 
-  async findAll(): Promise<Task[]> {
-    // Inefficient implementation: retrieves all tasks without pagination
-    // and loads all relations, causing potential performance issues
-    return this.tasksRepository.find({
-      relations: ['user'],
-    });
+  async findAll(
+    limit: number,
+    offset: number = 0,
+    status?: string,
+    priority?: string,
+  ): Promise<{ data: Task[]; count: number }> {
+    const queryBuilder = this.tasksRepository
+      .createQueryBuilder('task')
+      .leftJoinAndSelect('task.user', 'user')
+      .orderBy('task.createdAt', 'DESC');
+
+    if (status) {
+      queryBuilder.andWhere('task.status = :status', { status });
+    }
+
+    if (priority) {
+      queryBuilder.andWhere('task.priority = :priority', { priority });
+    }
+
+    const [data, count] = await queryBuilder.skip(offset).take(limit).getManyAndCount();
+
+    return { data, count };
   }
+
 
   async findOne(id: string): Promise<Task> {
     // Inefficient implementation: two separate database calls
