@@ -1,6 +1,6 @@
 import { Injectable, NotFoundException, HttpException, HttpStatus } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, DataSource, LessThan, Not } from 'typeorm';
 import { Task } from './entities/task.entity';
 import { CreateTaskDto } from './dto/create-task.dto';
 import { UpdateTaskDto } from './dto/update-task.dto';
@@ -9,11 +9,13 @@ import { Queue } from 'bullmq';
 import { TaskStatus } from './enums/task-status.enum';
 import { TaskPriority } from './enums/task-priority.enum';
 
+
 @Injectable()
 export class TasksService {
   constructor(
     @InjectRepository(Task)
     private tasksRepository: Repository<Task>,
+    private readonly dataSource: DataSource,
 
     @InjectQueue('task-processing')
     private taskQueue: Queue,
@@ -125,9 +127,43 @@ export class TasksService {
     return results;
   }
 
+  async updateStatusWithTransaction(taskId: string, status: string): Promise<Task> {
+    return await this.dataSource.transaction(async (manager) => {
+      const task: any = await manager.findOne(Task, { where: { id: taskId } });
+
+      if (!task) {
+        throw new Error(`Task with id ${taskId} not found`);
+      }
+
+      task.status = status;
+      return await manager.save(task);
+    });
+  }
+
   async updateStatus(id: string, status: TaskStatus): Promise<Task> {
     const task = await this.findOne(id);
     task.status = status;
     return this.tasksRepository.save(task);
   }
+
+  async getOverdueTasks(): Promise<Task[]> {
+    const now = new Date();
+
+    return await this.taskRepository.find({
+      where: {
+        dueDate: LessThan(now),
+        status: Not('completed'), // assuming "completed" means it's done
+      },
+      relations: ['user'], // assuming tasks are linked to users
+    });
+  }
+
+  async sendOverdueTaskNotifications(tasks: Task[]): Promise<void> {
+    for (const task of tasks) {
+      const user = task.user;
+      // Replace this with real notification logic (email, push, etc.)
+      console.log(`🔔 Notify ${user.email} about overdue task: ${task.title}`);
+    }
+  }
+
 }

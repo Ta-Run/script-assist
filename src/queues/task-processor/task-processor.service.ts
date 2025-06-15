@@ -8,15 +8,12 @@ import { TasksService } from '../../modules/tasks/tasks.service';
 export class TaskProcessorService extends WorkerHost {
   private readonly logger = new Logger(TaskProcessorService.name);
 
+  private readonly VALID_STATUSES = ['pending', 'in_progress', 'completed', 'failed'];
+
   constructor(private readonly tasksService: TasksService) {
-    super();
+    super({ concurrency: 5 });
   }
 
-  // Inefficient implementation:
-  // - No proper job batching
-  // - No error handling strategy
-  // - No retries for failed jobs
-  // - No concurrency control
   async process(job: Job): Promise<any> {
     this.logger.debug(`Processing job ${job.id} of type ${job.name}`);
 
@@ -27,13 +24,13 @@ export class TaskProcessorService extends WorkerHost {
         case 'overdue-tasks-notification':
           return await this.handleOverdueTasks(job);
         default:
-          this.logger.warn(`Unknown job type: ${job.name}`);
+          this.logger.warn(`Unknown job type received: ${job.name}`);
           return { success: false, error: 'Unknown job type' };
       }
-    } catch (error) {
-      // Basic error logging without proper handling or retries
-      this.logger.error(`Error processing job ${job.id}: ${error instanceof Error ? error.message : 'Unknown error'}`);
-      throw error; // Simply rethrows the error without any retry strategy
+    } catch (error: any) {
+      this.logger.error(`Job ${job.id} failed: ${error.message}`, error.stack);
+      // Let BullMQ retry automatically if configured
+      throw error;
     }
   }
 
@@ -41,27 +38,48 @@ export class TaskProcessorService extends WorkerHost {
     const { taskId, status } = job.data;
 
     if (!taskId || !status) {
-      return { success: false, error: 'Missing required data' };
+      this.logger.warn(`Missing required data for status update: ${JSON.stringify(job.data)}`);
+      return { success: false, error: 'Missing taskId or status' };
     }
 
-    // Inefficient: No validation of status values
-    // No transaction handling
-    // No retry mechanism
-    const task = await this.tasksService.updateStatus(taskId, status);
+    if (!this.VALID_STATUSES.includes(status)) {
+      this.logger.warn(`Invalid status value "${status}" for taskId ${taskId}`);
+      return { success: false, error: 'Invalid status value' };
+    }
 
-    return {
-      success: true,
-      taskId: task.id,
-      newStatus: task.status
-    };
+    try {
+      const task = await this.tasksService.updateStatusWithTransaction(taskId, status);
+
+      return {
+        success: true,
+        taskId: task.id,
+        newStatus: task.status,
+      };
+    } catch (err) {
+      this.logger.error(`Failed to update task status. taskId: ${taskId}, status: ${status}`, err.stack);
+      throw err;
+    }
   }
 
   private async handleOverdueTasks(job: Job) {
-    // Inefficient implementation with no batching or chunking for large datasets
-    this.logger.debug('Processing overdue tasks notification');
+    this.logger.debug('Fetching overdue tasks...');
 
-    // The implementation is deliberately basic and inefficient
-    // It should be improved with proper batching and error handling
-    return { success: true, message: 'Overdue tasks processed' };
+    const tasks = await this.tasksService.getOverdueTasks();
+
+    if (tasks.length === 0) {
+      this.logger.log('No overdue tasks found.');
+      return { success: true, message: 'No overdue tasks to process' };
+    }
+
+    this.logger.log(`Found ${tasks.length} overdue tasks. Sending notifications...`);
+
+    await this.tasksService.sendOverdueTaskNotifications(tasks);
+
+    return {
+      success: true,
+      processed: tasks.length,
+      message: 'Overdue task notifications sent',
+    };
   }
-} 
+
+}
