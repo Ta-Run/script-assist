@@ -11,7 +11,7 @@ export class TaskProcessorService extends WorkerHost {
   private readonly VALID_STATUSES = ['pending', 'in_progress', 'completed', 'failed'];
 
   constructor(private readonly tasksService: TasksService) {
-    super({ concurrency: 5 });
+    super();
   }
 
   async process(job: Job): Promise<any> {
@@ -55,7 +55,7 @@ export class TaskProcessorService extends WorkerHost {
         taskId: task.id,
         newStatus: task.status,
       };
-    } catch (err) {
+    } catch (err: any) {
       this.logger.error(`Failed to update task status. taskId: ${taskId}, status: ${status}`, err.stack);
       throw err;
     }

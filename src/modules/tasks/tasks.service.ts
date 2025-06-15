@@ -149,12 +149,12 @@ export class TasksService {
   async getOverdueTasks(): Promise<Task[]> {
     const now = new Date();
 
-    return await this.taskRepository.find({
+    return await this.tasksRepository.find({
       where: {
         dueDate: LessThan(now),
-        status: Not('completed'), // assuming "completed" means it's done
+        status: Not(TaskStatus.COMPLETED),
       },
-      relations: ['user'], // assuming tasks are linked to users
+      relations: ['user'],
     });
   }
 
